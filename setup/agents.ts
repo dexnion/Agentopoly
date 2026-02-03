@@ -153,8 +153,7 @@ export const monopolyTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'build_hotel',
-      description:
-        'Build a hotel on a property that currently has 4 houses.',
+      description: 'Build a hotel on a property that currently has 4 houses.',
       parameters: {
         type: 'object',
         properties: {
@@ -313,31 +312,6 @@ export const monopolyTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
-      name: 'get_game_state',
-      description: 'Get current game state summary.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'get_property_info',
-      description: 'Get details about a specific property.',
-      parameters: {
-        type: 'object',
-        properties: {
-          propertyLocation: {
-            type: 'number',
-            description: 'Board location for property.',
-          },
-        },
-        required: ['propertyLocation'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
       name: 'end_turn',
       description: 'End your turn.',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -351,9 +325,10 @@ const RETRY_DELAY_MS = 2000;
 export class MonopolyAgent {
   public player: Player;
   public model: modelSchema;
-  public conversationHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-    [];
+  private systemPrompt: OpenAI.Chat.Completions.ChatCompletionMessageParam;
+  public turnHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
   public interactions: AgentInteraction[] = [];
+  public turnInteractionCount = 0; // Per-turn counter
   private recordingsDir: string;
 
   constructor(player: Player, model: modelSchema, recordingsDir: string) {
@@ -361,30 +336,28 @@ export class MonopolyAgent {
     this.model = model;
     this.recordingsDir = recordingsDir;
 
-    this.conversationHistory.push({
+    this.systemPrompt = {
       role: 'system',
-      content: `You are playing Monopoly as ${player.name}. Your goal is to win by bankrupting opponents while managing your money strategically.
+      content: `You are playing Monopoly as ${player.name}. Win by bankrupting opponents.
 
 RULES:
-- Roll dice to move around the board
-- Buy properties when you land on them
-- Pay rent when landing on opponent properties
+- Roll dice to move, buy properties you land on, pay rent on opponent properties
 - Complete color groups to build houses/hotels for higher rent
-- Manage cash carefully - going bankrupt means losing
+- Going bankrupt = losing
 
-STRATEGY:
-- Complete color groups (monopolies) to build houses
-- Balance property acquisition with maintaining cash reserves
-- Consider mortgaging properties if low on cash
-- Orange and red properties are most landed-on
+TURN FLOW:
+1. Roll dice to move
+2. Handle where you land (buy property, pay rent, etc.)
+3. Optionally build houses if you have monopolies
+4. Call end_turn when done
 
-On EACH turn:
-1. Call "get_game_state" first to see the current situation
-2. Take actions using the provided tools
-3. Call "end_turn" when you're done
+Be concise. Use tools to act.`,
+    };
+  }
 
-Think strategically and explain your reasoning briefly before acting.`,
-    });
+  resetForNewTurn() {
+    this.turnHistory = [];
+    this.turnInteractionCount = 0; // Reset per-turn counter
   }
 
   async takeTurn(
@@ -398,9 +371,7 @@ Think strategically and explain your reasoning briefly before acting.`,
 TURN ${gameState.turn} - ${me.name}
 Position: ${me.position} (${tiles[me.position].name})
 Money: $${me.money}
-Properties: ${
-      me.properties.map((loc) => tiles[loc].name).join(', ') || 'None'
-    }
+Properties: ${me.properties.map((loc) => tiles[loc].name).join(', ') || 'None'}
 In Jail: ${me.inJail ? `Yes (turn ${me.jailTurns}/3)` : 'No'}
 
 Other Players:
@@ -408,46 +379,41 @@ ${gameState.players
   .filter((p) => p.id !== this.player.id)
   .map(
     (p) =>
-      `- ${p.name}: pos ${p.position} (${tiles[p.position].name}), $${p.money}, ${p.properties.length} properties${p.inJail ? ' [JAIL]' : ''}`
+      `- ${p.name}: $${p.money}, ${p.properties.length} properties${p.inJail ? ' [JAIL]' : ''}`
   )
   .join('\n')}
 
-${
-  pendingAction
-    ? `ACTION REQUIRED: ${pendingAction}`
-    : 'Your turn - use tools to act, then call end_turn.'
-}
+${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, then end_turn.'}
 `.trim();
 
-    this.conversationHistory.push({ role: 'user', content: contextPrompt });
+    this.turnHistory.push({ role: 'user', content: contextPrompt });
 
-    // Keep history bounded: system + last 20 messages
-    if (this.conversationHistory.length > 22) {
-      this.conversationHistory = [
-        this.conversationHistory[0],
-        ...this.conversationHistory.slice(-20),
-      ];
-    }
+    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      this.systemPrompt,
+      ...this.turnHistory,
+    ];
 
     let lastError: any = null;
     let releaseSlot: (() => void) | null = null;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        // Acquire rate limit slot BEFORE making request
         releaseSlot = await ProviderMgr.acquireSlot(this.model);
 
         const client = ProviderMgr.getClient(this.model);
-        const response = await client.chat.completions.create({
+        const params: any = {
           model: this.model.id,
-          messages: this.conversationHistory,
+          messages,
           tools: monopolyTools,
           tool_choice: 'auto',
           temperature: 0.7,
-          max_tokens: this.model.maxTokens || 500, // Use model's limit or default to 500
-        });
+        };
+        if (this.model.maxTokens) {
+          params.max_tokens = this.model.maxTokens;
+        }
 
-        // Update rate limits from response headers if available
+        const response = await client.chat.completions.create(params);
+
         if ((response as any).response?.headers) {
           ProviderMgr.updateRateLimits(
             this.model,
@@ -455,13 +421,13 @@ ${
           );
         }
 
-        // Release slot immediately after successful request
         releaseSlot();
         releaseSlot = null;
 
         const endTime = Date.now();
         const message = response.choices[0].message;
-        this.conversationHistory.push(message);
+
+        this.turnHistory.push(message);
 
         const interaction: AgentInteraction = {
           timestamp: new Date().toISOString(),
@@ -479,6 +445,7 @@ ${
         };
 
         this.interactions.push(interaction);
+        this.turnInteractionCount++; // Increment per-turn counter
         this.appendNDJSON('interactions.ndjson', interaction);
 
         const reasoning: ReasoningTrace = {
@@ -486,7 +453,7 @@ ${
           player: this.player.name,
           turn: gameState.turn,
           model: this.model.id,
-          inputSummary: `pos=${me.position} (${tiles[me.position].name}), $${me.money}, props=${me.properties.length}`,
+          inputSummary: `pos=${me.position}, $${me.money}, props=${me.properties.length}`,
           thought: message.content || '',
           chosenTools: (message.tool_calls || []).map(
             (t) => t.function.name || ''
@@ -496,15 +463,12 @@ ${
 
         return interaction;
       } catch (err: any) {
-        // Release slot on error
         if (releaseSlot) {
           releaseSlot();
           releaseSlot = null;
         }
 
         lastError = err;
-
-        // Check if it's a rate limit error
         const isRateLimit =
           err?.status === 429 ||
           err?.message?.toLowerCase().includes('rate limit') ||
@@ -525,7 +489,6 @@ ${
         });
 
         if (attempt < MAX_RETRIES) {
-          // If rate limit, wait longer
           const waitTime = isRateLimit
             ? RETRY_DELAY_MS * 3
             : RETRY_DELAY_MS * attempt;
@@ -535,7 +498,6 @@ ${
       }
     }
 
-    // Hard fallback: end turn
     console.error(
       `  💀 All retries failed for ${this.player.name}, forcing end_turn`
     );
@@ -556,6 +518,7 @@ ${
       latency: Date.now() - startTime,
     };
     this.interactions.push(fallback);
+    this.turnInteractionCount++; // Increment even for fallback
     this.appendNDJSON('interactions.ndjson', fallback);
     return fallback;
   }
@@ -564,7 +527,7 @@ ${
     toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall,
     result: any
   ) {
-    this.conversationHistory.push({
+    this.turnHistory.push({
       role: 'tool',
       tool_call_id: toolCall.id,
       content: JSON.stringify(result),
@@ -581,8 +544,9 @@ ${
   }
 
   reset() {
-    this.conversationHistory = this.conversationHistory.slice(0, 1);
+    this.turnHistory = [];
     this.interactions = [];
+    this.turnInteractionCount = 0;
   }
 
   private appendNDJSON(filename: string, obj: any) {
@@ -631,8 +595,7 @@ export class MonopolyMultiAgent {
       currentPlayerIndex: 0,
       properties: tiles
         .filter(
-          (t) =>
-            t.attributes.cost !== undefined && t.attributes.cost !== null
+          (t) => t.attributes.cost !== undefined && t.attributes.cost !== null
         )
         .map((t) => ({
           tile: t,

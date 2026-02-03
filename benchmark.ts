@@ -1,23 +1,19 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import OpenAI from 'openai';
-
-import {
-  MonopolyMultiAgent,
-  Player,
-} from './setup/agents';
-import { models, generatePlayers, modelSchema } from './setup/models';
+import { MonopolyMultiAgent, Player } from './setup/agents';
+import { models, modelSchema, generatePlayers } from './setup/models';
 import { tiles } from './setup/board';
 
 export class MonopolyBenchmark {
-  private multiAgent: MonopolyMultiAgent;
-  private maxTurns: number;
+  public multiAgent: MonopolyMultiAgent;
+  public maxTurns: number;
   private doublesCount = 0;
   private currentDiceRoll:
     | { die1: number; die2: number; total: number; doubles: boolean }
     | null = null;
-  private gameId: string;
-  private recordingsDir: string;
+  public gameId: string;
+  public recordingsDir: string;
 
   constructor(players: Player[], modelDefs: modelSchema[], maxTurns = 200) {
     this.gameId = new Date().toISOString().replace(/[:.]/g, '-');
@@ -42,9 +38,7 @@ export class MonopolyBenchmark {
     console.log(`Game ID: ${this.gameId}`);
     console.log(`Recording dir: ${this.recordingsDir}`);
     console.log(
-      `Players: ${this.multiAgent.gameState.players
-        .map((p) => p.name)
-        .join(', ')}`
+      `Players: ${this.multiAgent.gameState.players.map((p) => p.name).join(', ')}`
     );
     console.log(`Max turns: ${this.maxTurns}\n`);
 
@@ -82,10 +76,13 @@ export class MonopolyBenchmark {
     this.multiAgent.gameState.turn++;
     const player = this.multiAgent.getCurrentPlayer();
     const agent = this.multiAgent.getCurrentAgent();
+    // FRESH CONVERSATION FOR NEW TURN
+    agent.resetForNewTurn();
 
     console.log(
       `\n=== TURN ${this.multiAgent.gameState.turn}: ${player.name} ===`
     );
+
     const idxStart = this.multiAgent.logs.length;
     this.multiAgent.log(
       'TURN_START',
@@ -112,8 +109,8 @@ export class MonopolyBenchmark {
 
     while (!turnEnded && !player.bankrupt) {
       const interaction = await agent.takeTurn(this.multiAgent.gameState);
-
       const toolCalls = interaction.toolCalls || [];
+
       if (toolCalls.length === 0) {
         turnEnded = true;
       } else {
@@ -133,9 +130,9 @@ export class MonopolyBenchmark {
         }
       }
 
-      if (agent.interactions.length > 50) {
+      if (agent.interactions.length > 20) {
         console.warn(
-          `⚠️  ${player.name} exceeded 50 interactions, forcing end_turn`
+          `⚠️ ${player.name} exceeded 20 interactions, forcing end_turn`
         );
         turnEnded = true;
       }
@@ -144,69 +141,78 @@ export class MonopolyBenchmark {
     this.multiAgent.nextPlayer();
   }
 
-  private async executeToolCall(
-    toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall,
-    player: Player,
-    _agent: any
-  ): Promise<any> {
-    const fn = toolCall.function.name;
-    const args = JSON.parse(toolCall.function.arguments || '{}');
-    console.log(`  🔧 ${player.name} -> ${fn}`, args);
+private async executeToolCall(
+  toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall,
+  player: Player,
+  _agent: any
+): Promise<any> {
+  const fn = toolCall.function.name;
 
-    switch (fn) {
-      case 'roll_dice':
-        return this.handleRollDice(player);
-      case 'buy_property':
-        return this.handleBuyProperty(player, args.confirm);
-      case 'auction_bid':
-        return this.handleAuctionBid(player, args.amount);
-      case 'pass_auction':
-        return this.handlePassAuction(player);
-      case 'build_house':
-        return this.handleBuildHouse(player, args.propertyLocation);
-      case 'build_hotel':
-        return this.handleBuildHotel(player, args.propertyLocation);
-      case 'mortgage_property':
-        return this.handleMortgageProperty(player, args.propertyLocation);
-      case 'unmortgage_property':
-        return this.handleUnmortgageProperty(player, args.propertyLocation);
-      case 'sell_house':
-        return this.handleSellHouse(player, args.propertyLocation);
-      case 'sell_hotel':
-        return this.handleSellHotel(player, args.propertyLocation);
-      case 'pay_jail_fine':
-        return this.handlePayJailFine(player);
-      case 'use_jail_card':
-        return this.handleUseJailCard(player);
-      case 'trade_property':
-        return this.handleTradeProposal(player, args);
-      case 'respond_to_trade':
-        return this.handleTradeResponse(player, args.accept);
-      case 'get_game_state':
-        return this.handleGetGameState(player);
-      case 'get_property_info':
-        return this.handleGetPropertyInfo(args.propertyLocation);
-      case 'end_turn':
-        return { success: true, turnEnded: true };
-      default:
-        return { success: false, error: `Unknown tool: ${fn}` };
+  // Robust argument parsing
+  let args: any = {};
+  try {
+    const raw = toolCall.function.arguments;
+    if (raw && raw.trim().length > 0) {
+      args = JSON.parse(raw);
     }
+  } catch (e) {
+    console.warn(
+      `⚠️ Failed to parse tool arguments for ${fn}, raw=`,
+      toolCall.function.arguments
+    );
+    args = {};
   }
 
-  // --- Core handlers (movement, buy, rent, jail, etc.) ---
+  console.log(`  🔧 ${player.name} -> ${fn}`, args);
+
+  switch (fn) {
+    case 'roll_dice':
+      return this.handleRollDice(player);
+    case 'buy_property':
+      return this.handleBuyProperty(player, args.confirm);
+    case 'auction_bid':
+      return this.handleAuctionBid(player, args.amount);
+    case 'pass_auction':
+      return this.handlePassAuction(player);
+    case 'build_house':
+      return this.handleBuildHouse(player, args.propertyLocation);
+    case 'build_hotel':
+      return this.handleBuildHotel(player, args.propertyLocation);
+    case 'mortgage_property':
+      return this.handleMortgageProperty(player, args.propertyLocation);
+    case 'unmortgage_property':
+      return this.handleUnmortgageProperty(player, args.propertyLocation);
+    case 'sell_house':
+      return this.handleSellHouse(player, args.propertyLocation);
+    case 'sell_hotel':
+      return this.handleSellHotel(player, args.propertyLocation);
+    case 'pay_jail_fine':
+      return this.handlePayJailFine(player);
+    case 'use_jail_card':
+      return this.handleUseJailCard(player);
+    case 'trade_property':
+      return this.handleTradeProposal(player, args);
+    case 'respond_to_trade':
+      return this.handleTradeResponse(player, !!args.accept);
+    case 'get_game_state':
+      return this.handleGetGameState(player);
+    case 'get_property_info':
+      return this.handleGetPropertyInfo(args.propertyLocation);
+    case 'end_turn':
+      return { success: true, turnEnded: true };
+    default:
+      return { success: false, error: `Unknown tool: ${fn}` };
+  }
+}
 
   private handleRollDice(player: Player) {
     const roll = this.multiAgent.rollDice();
     this.currentDiceRoll = roll;
-
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log('DICE_ROLL', roll, player);
     this.multiAgent.logWithAfter(idx);
-
     console.log(
-      `  🎲 Rolled ${roll.die1} + ${roll.die2} = ${roll.total}${
-        roll.doubles ? ' (doubles)' : ''
-      }`
+      `  🎲 Rolled ${roll.die1} + ${roll.die2} = ${roll.total}${roll.doubles ? ' (doubles)' : ''}`
     );
 
     if (roll.doubles) {
@@ -219,7 +225,6 @@ export class MonopolyBenchmark {
 
     const oldPos = player.position;
     player.position = (player.position + roll.total) % 40;
-
     if (player.position < oldPos || oldPos + roll.total >= 40) {
       player.money += 200;
       const idx2 = this.multiAgent.logs.length;
@@ -278,7 +283,7 @@ export class MonopolyBenchmark {
         break;
       case 'free_parking':
       case 'visiting_jail':
-        console.log(`  🅿️  Resting on ${tile.name}`);
+        console.log(`  🅿️ Resting on ${tile.name}`);
         break;
     }
   }
@@ -290,9 +295,7 @@ export class MonopolyBenchmark {
     if (!property) return;
 
     if (property.owner === null) {
-      console.log(
-        `  🏠 ${tile.name} is available for $${tile.attributes.cost}`
-      );
+      console.log(`  🏠 ${tile.name} is available for $${tile.attributes.cost}`);
     } else if (property.owner === player.id) {
       console.log('  ✅ You own this property');
     } else {
@@ -329,8 +332,7 @@ export class MonopolyBenchmark {
 
     if (property.tile.type === 'utilities' && this.currentDiceRoll) {
       const count = this.countUtilitiesOwned(owner.id);
-      rent =
-        this.currentDiceRoll.total * (count === 1 ? 4 : 10);
+      rent = this.currentDiceRoll.total * (count === 1 ? 4 : 10);
     }
 
     console.log(`  💸 Paying $${rent} to ${owner.name}`);
@@ -358,14 +360,17 @@ export class MonopolyBenchmark {
     const property = this.multiAgent.gameState.properties.find(
       (p) => p.tile.location === tile.location
     );
+
     if (!property) {
       return { success: false, error: 'Not a purchasable property' };
     }
+
     if (property.owner !== null) {
       return { success: false, error: 'Already owned' };
     }
 
     const cost = tile.attributes.cost || 0;
+
     if (!confirm) {
       console.log('  🔨 Declined, starting auction');
       this.startAuction(property);
@@ -390,8 +395,8 @@ export class MonopolyBenchmark {
       player
     );
     this.multiAgent.logWithAfter(idx);
-
     console.log(`  ✅ Bought ${tile.name} for $${cost}`);
+
     return { success: true, property: tile.name, cost };
   }
 
@@ -419,9 +424,7 @@ export class MonopolyBenchmark {
       winner.money -= bestBid;
       property.owner = winner.id;
       winner.properties.push(property.tile.location);
-      console.log(
-        `  ✅ ${winner.name} wins auction for $${bestBid}`
-      );
+      console.log(`  ✅ ${winner.name} wins auction for $${bestBid}`);
       const idx2 = this.multiAgent.logs.length;
       this.multiAgent.log(
         'AUCTION_WON',
@@ -438,6 +441,14 @@ export class MonopolyBenchmark {
     }
   }
 
+  private handleAuctionBid(player: Player, amount: number) {
+    return { success: true, bid: amount };
+  }
+
+  private handlePassAuction(player: Player) {
+    return { success: true, passed: true };
+  }
+
   private handleBuildHouse(player: Player, loc: number) {
     const property = this.multiAgent.gameState.properties.find(
       (p) => p.tile.location === loc
@@ -445,27 +456,17 @@ export class MonopolyBenchmark {
     if (!property) return { success: false, error: 'Property not found' };
     if (property.owner !== player.id)
       return { success: false, error: 'Not owner' };
-
     if (!this.hasMonopoly(player.id, property.tile)) {
-      return {
-        success: false,
-        error: 'Need full color group to build',
-      };
+      return { success: false, error: 'Need full color group to build' };
     }
     if (property.hotels > 0) {
       return { success: false, error: 'Has a hotel already' };
     }
     if (property.houses >= 4) {
-      return {
-        success: false,
-        error: 'Already 4 houses, build hotel instead',
-      };
+      return { success: false, error: 'Already 4 houses, build hotel instead' };
     }
     if (!this.canBuildEvenly(player.id, property.tile)) {
-      return {
-        success: false,
-        error: 'Must build evenly across color group',
-      };
+      return { success: false, error: 'Must build evenly across color group' };
     }
     if (this.multiAgent.gameState.houses <= 0) {
       return { success: false, error: 'No houses in bank' };
@@ -483,18 +484,12 @@ export class MonopolyBenchmark {
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log(
       'BUILD_HOUSE',
-      {
-        property: property.tile.name,
-        cost,
-        houses: property.houses,
-      },
+      { property: property.tile.name, cost, houses: property.houses },
       player
     );
     this.multiAgent.logWithAfter(idx);
+    console.log(`  🏗️ Built house on ${property.tile.name} for $${cost}`);
 
-    console.log(
-      `  🏗️  Built house on ${property.tile.name} for $${cost}`
-    );
     return { success: true };
   }
 
@@ -506,10 +501,7 @@ export class MonopolyBenchmark {
     if (property.owner !== player.id)
       return { success: false, error: 'Not owner' };
     if (property.houses !== 4) {
-      return {
-        success: false,
-        error: 'Must have exactly 4 houses to build hotel',
-      };
+      return { success: false, error: 'Must have exactly 4 houses to build hotel' };
     }
     if (this.multiAgent.gameState.hotels <= 0) {
       return { success: false, error: 'No hotels in bank' };
@@ -533,10 +525,8 @@ export class MonopolyBenchmark {
       player
     );
     this.multiAgent.logWithAfter(idx);
+    console.log(`  🏨 Built hotel on ${property.tile.name} for $${cost}`);
 
-    console.log(
-      `  🏨 Built hotel on ${property.tile.name} for $${cost}`
-    );
     return { success: true };
   }
 
@@ -551,10 +541,7 @@ export class MonopolyBenchmark {
       return { success: false, error: 'Already mortgaged' };
     }
     if (this.colorGroupHasBuildings(player.id, property.tile)) {
-      return {
-        success: false,
-        error: 'Sell all buildings in color group first',
-      };
+      return { success: false, error: 'Sell all buildings in color group first' };
     }
 
     const value = Math.floor((property.tile.attributes.cost || 0) / 2);
@@ -568,10 +555,8 @@ export class MonopolyBenchmark {
       player
     );
     this.multiAgent.logWithAfter(idx);
+    console.log(`  🏦 Mortgaged ${property.tile.name} for $${value}`);
 
-    console.log(
-      `  🏦 Mortgaged ${property.tile.name} for $${value}`
-    );
     return { success: true };
   }
 
@@ -602,10 +587,8 @@ export class MonopolyBenchmark {
       player
     );
     this.multiAgent.logWithAfter(idx);
+    console.log(`  🏦 Unmortgaged ${property.tile.name} for $${cost}`);
 
-    console.log(
-      `  🏦 Unmortgaged ${property.tile.name} for $${cost}`
-    );
     return { success: true };
   }
 
@@ -620,10 +603,7 @@ export class MonopolyBenchmark {
       return { success: false, error: 'No houses to sell' };
     }
     if (!this.canSellEvenly(player.id, property.tile)) {
-      return {
-        success: false,
-        error: 'Must sell evenly across color group',
-      };
+      return { success: false, error: 'Must sell evenly across color group' };
     }
 
     const cost = this.getHouseCost(property.tile);
@@ -635,18 +615,12 @@ export class MonopolyBenchmark {
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log(
       'SELL_HOUSE',
-      {
-        property: property.tile.name,
-        value,
-        housesRemaining: property.houses,
-      },
+      { property: property.tile.name, value, housesRemaining: property.houses },
       player
     );
     this.multiAgent.logWithAfter(idx);
+    console.log(`  🔨 Sold house on ${property.tile.name} for $${value}`);
 
-    console.log(
-      `  🔨 Sold house on ${property.tile.name} for $${value}`
-    );
     return { success: true };
   }
 
@@ -664,7 +638,6 @@ export class MonopolyBenchmark {
     const houseCost = this.getHouseCost(property.tile);
     const hotelCost = houseCost * 5;
     const value = Math.floor(hotelCost / 2);
-
     player.money += value;
     property.hotels = 0;
     property.houses = 4;
@@ -678,17 +651,13 @@ export class MonopolyBenchmark {
       player
     );
     this.multiAgent.logWithAfter(idx);
+    console.log(`  🔨 Sold hotel on ${property.tile.name} for $${value}`);
 
-    console.log(
-      `  🔨 Sold hotel on ${property.tile.name} for $${value}`
-    );
     return { success: true };
   }
 
   private async handleJail(player: Player) {
-    console.log(
-      `  🔒 ${player.name} is in jail (turn ${player.jailTurns}/3)`
-    );
+    console.log(`  🔒 ${player.name} is in jail (turn ${player.jailTurns}/3)`);
     player.jailTurns++;
 
     if (player.jailTurns >= 3) {
@@ -708,6 +677,7 @@ export class MonopolyBenchmark {
 
     const roll = this.multiAgent.rollDice();
     console.log(`  🎲 Jail roll: ${roll.die1} + ${roll.die2}`);
+
     if (roll.doubles) {
       player.inJail = false;
       player.jailTurns = 0;
@@ -716,9 +686,7 @@ export class MonopolyBenchmark {
       this.multiAgent.log('JAIL_DOUBLES', { roll }, player);
       this.multiAgent.logWithAfter(idx);
       console.log(
-        `  ✅ Doubles! Out of jail, moved to ${
-          tiles[player.position].name
-        }`
+        `  ✅ Doubles! Out of jail, moved to ${tiles[player.position].name}`
       );
       this.handleLanding(player);
     } else {
@@ -730,10 +698,8 @@ export class MonopolyBenchmark {
   }
 
   private handlePayJailFine(player: Player) {
-    if (!player.inJail)
-      return { success: false, error: 'Not in jail' };
-    if (player.money < 50)
-      return { success: false, error: 'Need $50' };
+    if (!player.inJail) return { success: false, error: 'Not in jail' };
+    if (player.money < 50) return { success: false, error: 'Need $50' };
 
     player.money -= 50;
     player.inJail = false;
@@ -743,17 +709,14 @@ export class MonopolyBenchmark {
     this.multiAgent.log('PAY_JAIL_FINE', { amount: 50 }, player);
     this.multiAgent.logWithAfter(idx);
     console.log('  💰 Paid $50 and left jail');
+
     return { success: true };
   }
 
   private handleUseJailCard(player: Player) {
-    if (!player.inJail)
-      return { success: false, error: 'Not in jail' };
+    if (!player.inJail) return { success: false, error: 'Not in jail' };
     if (player.jailFreeCards === 0)
-      return {
-        success: false,
-        error: 'No Get Out of Jail Free card',
-      };
+      return { success: false, error: 'No Get Out of Jail Free card' };
 
     player.jailFreeCards--;
     player.inJail = false;
@@ -763,6 +726,7 @@ export class MonopolyBenchmark {
     this.multiAgent.log('USE_JAIL_CARD', {}, player);
     this.multiAgent.logWithAfter(idx);
     console.log('  🎫 Used Get Out of Jail Free card');
+
     return { success: true };
   }
 
@@ -772,6 +736,7 @@ export class MonopolyBenchmark {
       ...this.multiAgent.gameState.chanceCards.slice(1),
       card,
     ];
+
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log(
       'DRAW_CHANCE',
@@ -780,6 +745,7 @@ export class MonopolyBenchmark {
     );
     this.multiAgent.logWithAfter(idx);
     console.log(`  🎴 Chance: ${card.name}`);
+
     this.executeCardEffect(player, card);
   }
 
@@ -789,6 +755,7 @@ export class MonopolyBenchmark {
       ...this.multiAgent.gameState.communityChestCards.slice(1),
       card,
     ];
+
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log(
       'DRAW_COMMUNITY_CHEST',
@@ -797,6 +764,7 @@ export class MonopolyBenchmark {
     );
     this.multiAgent.logWithAfter(idx);
     console.log(`  🎴 Community Chest: ${card.name}`);
+
     this.executeCardEffect(player, card);
   }
 
@@ -810,9 +778,7 @@ export class MonopolyBenchmark {
         player.money += 200;
         console.log('  💰 Passed GO via card, collected $200');
       }
-      console.log(
-        `  📍 Card moved you to ${tiles[player.position].name}`
-      );
+      console.log(`  📍 Card moved you to ${tiles[player.position].name}`);
       this.handleLanding(player);
     }
 
@@ -841,9 +807,7 @@ export class MonopolyBenchmark {
         p.money -= amt;
         player.money += amt;
       }
-      console.log(
-        `  💰 Collected $${attrs.perPlayer} from each player`
-      );
+      console.log(`  💰 Collected $${attrs.perPlayer} from each player`);
     }
 
     if (attrs.payToPlayers && attrs.perPlayer) {
@@ -856,9 +820,7 @@ export class MonopolyBenchmark {
           player.money -= attrs.perPlayer;
           p.money += attrs.perPlayer;
         }
-        console.log(
-          `  💸 Paid $${attrs.perPlayer} to each player`
-        );
+        console.log(`  💸 Paid $${attrs.perPlayer} to each player`);
       } else {
         this.handleBankruptcy(player, null);
       }
@@ -959,17 +921,14 @@ export class MonopolyBenchmark {
   }
 
   private handleTradeProposal(player: Player, args: any) {
-    console.log(
-      `  🤝 ${player.name} proposes trade to ${args.targetPlayer}`
-    );
+    console.log(`  🤝 ${player.name} proposes trade to ${args.targetPlayer}`);
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log('TRADE_PROPOSAL', args, player);
     this.multiAgent.logWithAfter(idx);
     return {
       success: true,
       tradePending: true,
-      message:
-        'Trade proposal recorded (actual negotiation not implemented).',
+      message: 'Trade proposal recorded (actual negotiation not implemented).',
     };
   }
 
@@ -1022,8 +981,6 @@ export class MonopolyBenchmark {
     };
   }
 
-  // --- Helper calculations ---
-
   private hasMonopoly(playerId: string, tile: any) {
     const color = tile.attributes.color;
     if (!color) return false;
@@ -1061,33 +1018,34 @@ export class MonopolyBenchmark {
     const color = tile.attributes.color;
     if (!color) return false;
     return this.multiAgent.gameState.properties
-      .filter(
-        (p) => p.tile.attributes.color === color && p.owner === playerId
-      )
+      .filter((p) => p.tile.attributes.color === color && p.owner === playerId)
       .some((p) => p.houses > 0 || p.hotels > 0);
   }
 
   private calculateHouseRent(property: any): number {
-  const a = property.tile.attributes;
-  if (!a) return 0;
-  switch (property.houses) {
-    case 1: return a.rent1House ?? 0;
-    case 2: return a.rent2Houses ?? 0;
-    case 3: return a.rent3Houses ?? 0;
-    case 4: return a.rent4Houses ?? 0;
-    default: return a.rent_amount ?? 0;
+    const a = property.tile.attributes;
+    if (!a) return 0;
+    switch (property.houses) {
+      case 1:
+        return a.rent1House ?? 0;
+      case 2:
+        return a.rent2Houses ?? 0;
+      case 3:
+        return a.rent3Houses ?? 0;
+      case 4:
+        return a.rent4Houses ?? 0;
+      default:
+        return a.rent_amount ?? 0;
+    }
   }
-}
 
-// Replace calculateHotelRent in benchmark.ts:
-private calculateHotelRent(property: any): number {
-  return property.tile.attributes?.rentHotel ?? 0;
-}
+  private calculateHotelRent(property: any): number {
+    return property.tile.attributes?.rentHotel ?? 0;
+  }
 
-// Replace getHouseCost in benchmark.ts:
-private getHouseCost(tile: any): number {
-  return tile.attributes.houseCost ?? 0;
-}
+  private getHouseCost(tile: any): number {
+    return tile.attributes.houseCost ?? 0;
+  }
 
   private countRailroadsOwned(playerId: string) {
     return this.multiAgent.gameState.properties.filter(
@@ -1117,11 +1075,10 @@ private getHouseCost(tile: any): number {
   }
 
   private determineWinnerByNetWorth() {
-    const active = this.multiAgent.gameState.players.filter(
-      (p) => !p.bankrupt
-    );
+    const active = this.multiAgent.gameState.players.filter((p) => !p.bankrupt);
     let best: Player | null = null;
     let bestWorth = 0;
+
     for (const p of active) {
       const w = this.calculateNetWorth(p);
       if (w > bestWorth) {
@@ -1129,12 +1086,11 @@ private getHouseCost(tile: any): number {
         best = p;
       }
     }
+
     if (best) {
       this.multiAgent.gameState.gameOver = true;
       this.multiAgent.gameState.winner = best.name;
-      console.log(
-        `\n🏆 Winner by net worth: ${best.name} ($${bestWorth})`
-      );
+      console.log(`\n🏆 Winner by net worth: ${best.name} ($${bestWorth})`);
       const idx = this.multiAgent.logs.length;
       this.multiAgent.log(
         'GAME_OVER_NET_WORTH',
@@ -1152,10 +1108,7 @@ private getHouseCost(tile: any): number {
       turn: this.multiAgent.gameState.turn,
       state: this.multiAgent.gameState,
     };
-    const file = path.join(
-      this.recordingsDir,
-      'state_snapshots.ndjson'
-    );
+    const file = path.join(this.recordingsDir, 'state_snapshots.ndjson');
     try {
       fs.appendFileSync(file, JSON.stringify(snap) + '\n', 'utf8');
     } catch (e) {
@@ -1167,45 +1120,35 @@ private getHouseCost(tile: any): number {
     const data = this.multiAgent.exportGameData();
     const file = path.join(this.recordingsDir, 'final_summary.json');
     fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
-
     console.log(`\n📊 Saved final summary to ${file}`);
     console.log('\n=== FINAL STATS ===');
     console.log(`Winner: ${data.statistics.winner}`);
     console.log(`Turns: ${data.statistics.totalTurns}`);
     console.log(`Interactions: ${data.statistics.totalInteractions}`);
     console.log(`Tokens: ${data.statistics.totalTokensUsed}`);
-    console.log(
-      `Avg latency: ${data.statistics.averageLatency.toFixed(2)} ms`
-    );
+    console.log(`Avg latency: ${data.statistics.averageLatency.toFixed(2)} ms`);
   }
 }
 
 async function main() {
-  const NUM_GAMES = 5; // Run 5 games automatically
+  const NUM_GAMES = 1;
   const MAX_TURNS_PER_GAME = 100;
 
   console.log(`\n🎮 Starting Monopoly Benchmark Suite`);
   console.log(`📊 Running ${NUM_GAMES} games with ${models.length} players\n`);
 
-  const allGameResults = [];
+  const allGameResults: any[] = [];
 
   for (let gameNum = 1; gameNum <= NUM_GAMES; gameNum++) {
     console.log(`\n${'='.repeat(60)}`);
     console.log(`🎲 GAME ${gameNum}/${NUM_GAMES}`);
     console.log(`${'='.repeat(60)}\n`);
 
-    // Generate fresh players for each game
     const players = generatePlayers(models);
-
-    const benchmark = new MonopolyBenchmark(
-      players,
-      models,
-      MAX_TURNS_PER_GAME
-    );
+    const benchmark = new MonopolyBenchmark(players, models, MAX_TURNS_PER_GAME);
 
     await benchmark.runBenchmark();
 
-    // Collect results
     const gameData = benchmark.multiAgent.exportGameData();
     allGameResults.push({
       gameNumber: gameNum,
@@ -1216,80 +1159,77 @@ async function main() {
       avgLatency: gameData.statistics.averageLatency,
     });
 
-    // Short break between games to avoid rate limits
     if (gameNum < NUM_GAMES) {
       console.log(`\n⏸️  Cooling down for 5 seconds before next game...\n`);
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
   }
 
-  // Print aggregate statistics
-  console.log(`\n\n${'='.repeat(60)}`);
-  console.log(`📊 BENCHMARK SUITE COMPLETE`);
-  console.log(`${'='.repeat(60)}\n`);
+  if (NUM_GAMES > 1) {
+    console.log(`\n\n${'='.repeat(60)}`);
+    console.log(`📊 BENCHMARK SUITE COMPLETE`);
+    console.log(`${'='.repeat(60)}\n`);
 
-  console.log(`Games played: ${NUM_GAMES}`);
-  console.log(`\nResults by game:`);
-  allGameResults.forEach((result) => {
-    console.log(
-      `  Game ${result.gameNumber}: ${result.winner} won in ${result.turns} turns (${result.tokens} tokens)`
-    );
-  });
-
-  // Win statistics
-  console.log(`\nWin counts:`);
-  const winCounts: Record<string, number> = {};
-  allGameResults.forEach((result) => {
-    winCounts[result.winner] = (winCounts[result.winner] || 0) + 1;
-  });
-  Object.entries(winCounts)
-    .sort(([, a], [, b]) => b - a)
-    .forEach(([name, wins]) => {
+    console.log(`Games played: ${NUM_GAMES}`);
+    console.log(`\nResults by game:`);
+    allGameResults.forEach((result) => {
       console.log(
-        `  ${name}: ${wins} wins (${((wins / NUM_GAMES) * 100).toFixed(1)}%)`
+        `  Game ${result.gameNumber}: ${result.winner} won in ${result.turns} turns (${result.tokens} tokens)`
       );
     });
 
-  // Average statistics
-  const avgTurns =
-    allGameResults.reduce((sum, r) => sum + r.turns, 0) / NUM_GAMES;
-  const avgTokens =
-    allGameResults.reduce((sum, r) => sum + r.tokens, 0) / NUM_GAMES;
-  const avgLatency =
-    allGameResults.reduce((sum, r) => sum + r.avgLatency, 0) / NUM_GAMES;
+    console.log(`\nWin counts:`);
+    const winCounts: Record<string, number> = {};
+    allGameResults.forEach((result) => {
+      winCounts[result.winner] = (winCounts[result.winner] || 0) + 1;
+    });
+    Object.entries(winCounts)
+      .sort(([, a], [, b]) => b - a)
+      .forEach(([name, wins]) => {
+        console.log(
+          `  ${name}: ${wins} wins (${((wins / NUM_GAMES) * 100).toFixed(1)}%)`
+        );
+      });
 
-  console.log(`\nAverages:`);
-  console.log(`  Turns per game: ${avgTurns.toFixed(1)}`);
-  console.log(`  Tokens per game: ${avgTokens.toFixed(0)}`);
-  console.log(`  Avg latency: ${avgLatency.toFixed(2)}ms`);
+    const avgTurns =
+      allGameResults.reduce((sum, r) => sum + r.turns, 0) / NUM_GAMES;
+    const avgTokens =
+      allGameResults.reduce((sum, r) => sum + r.tokens, 0) / NUM_GAMES;
+    const avgLatency =
+      allGameResults.reduce((sum, r) => sum + r.avgLatency, 0) / NUM_GAMES;
 
-  // Save aggregate results
-  const summaryPath = path.join(
-    process.cwd(),
-    'game_recordings',
-    `benchmark_summary_${new Date().toISOString().replace(/[:.]/g, '-')}.json`
-  );
-  fs.writeFileSync(
-    summaryPath,
-    JSON.stringify(
-      {
-        timestamp: new Date().toISOString(),
-        numGames: NUM_GAMES,
-        models: models.map((m) => ({ name: m.name, id: m.id })),
-        results: allGameResults,
-        aggregateStats: {
-          winCounts,
-          avgTurns,
-          avgTokens,
-          avgLatency,
+    console.log(`\nAverages:`);
+    console.log(`  Turns per game: ${avgTurns.toFixed(1)}`);
+    console.log(`  Tokens per game: ${avgTokens.toFixed(0)}`);
+    console.log(`  Avg latency: ${avgLatency.toFixed(2)}ms`);
+
+    const summaryPath = path.join(
+      process.cwd(),
+      'game_recordings',
+      `benchmark_summary_${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    );
+    fs.writeFileSync(
+      summaryPath,
+      JSON.stringify(
+        {
+          timestamp: new Date().toISOString(),
+          numGames: NUM_GAMES,
+          models: models.map((m) => ({ name: m.name, id: m.id })),
+          results: allGameResults,
+          aggregateStats: {
+            winCounts,
+            avgTurns,
+            avgTokens,
+            avgLatency,
+          },
         },
-      },
-      null,
-      2
-    ),
-    'utf8'
-  );
-  console.log(`\n📁 Saved aggregate results to: ${summaryPath}\n`);
+        null,
+        2
+      ),
+      'utf8'
+    );
+    console.log(`\n📁 Saved aggregate results to: ${summaryPath}\n`);
+  }
 }
 
 if (require.main === module) {
