@@ -312,6 +312,31 @@ export const monopolyTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'get_game_state',
+      description: 'Get current game state information.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_property_info',
+      description: 'Get detailed information about a specific property.',
+      parameters: {
+        type: 'object',
+        properties: {
+          propertyLocation: {
+            type: 'number',
+            description: 'Board location of property.',
+          },
+        },
+        required: ['propertyLocation'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'end_turn',
       description: 'End your turn.',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -321,6 +346,7 @@ export const monopolyTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
+const MAX_MESSAGES = 30;
 
 export class MonopolyAgent {
   public player: Player;
@@ -328,36 +354,83 @@ export class MonopolyAgent {
   private systemPrompt: OpenAI.Chat.Completions.ChatCompletionMessageParam;
   public turnHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
   public interactions: AgentInteraction[] = [];
-  public turnInteractionCount = 0; // Per-turn counter
+  public turnInteractionCount = 0;
   private recordingsDir: string;
+  
+  // NEW: Track roll state
+  private hasRolledThisTurn = false;
+  private doublesCount = 0;
 
   constructor(player: Player, model: modelSchema, recordingsDir: string) {
     this.player = player;
     this.model = model;
     this.recordingsDir = recordingsDir;
-
     this.systemPrompt = {
       role: 'system',
-      content: `You are playing Monopoly as ${player.name}. Win by bankrupting opponents.
+      content: `You are playing Monopoly as ${player.name}. Win by the standard ruleset.
+
+PROPERTY GROUPS (for building houses/hotels – must own ALL in group):
+- Brown: Mediterranean Avenue (1), Baltic Avenue (3)
+- Light Blue: Oriental Avenue (6), Vermont Avenue (8), Connecticut Avenue (9)
+- Pink: St. Charles Place (11), States Avenue (13), Virginia Avenue (14)
+- Orange: St. James Place (16), Tennessee Avenue (18), New York Avenue (19)
+- Red: Kentucky Avenue (21), Indiana Avenue (23), Illinois Avenue (24)
+- Yellow: Atlantic Avenue (26), Ventnor Avenue (27), Marvin Gardens (29)
+- Green: Pacific Avenue (31), North Carolina Avenue (32), Pennsylvania Avenue (34)
+- Dark Blue: Park Place (37), Boardwalk (39)
+- Railroads: Reading (5), Pennsylvania (15), B&O (25), Short Line (35)
+- Utilities: Electric Company (12), Water Works (28)
 
 RULES:
-- Roll dice to move, buy properties you land on, pay rent on opponent properties
-- Complete color groups to build houses/hotels for higher rent
-- Going bankrupt = losing
+- Roll dice to move, buy properties you land on, pay rent on opponent properties.
+- Complete color groups to build houses/hotels for higher rent.
+- You may roll the dice once per turn (you'll be allowed to roll again if you roll doubles).
+- Going bankrupt = losing.
 
 TURN FLOW:
-1. Roll dice to move
-2. Handle where you land (buy property, pay rent, etc.)
-3. Optionally build houses if you have monopolies
-4. Call end_turn when done
+1. Roll dice to move.
+2. Handle where you land (buy property, pay rent, draw card, etc.).
+3. Optionally build houses/hotels if you have monopolies and enough cash.
+4. Call end_turn when you are done with all actions for this turn.
 
-Be concise. Use tools to act.`,
+CRITICAL:
+- You MUST call tools to take actions. You cannot act without tools.
+- If you roll doubles, you may roll again (the system will tell you "canRollAgain: true").
+- Prefer a small number of decisive tool calls over many redundant queries.
+
+Be concise. Use tools to act.
+
+FYI, null on a property being owned = unowned
+
+Good luck!
+`,
     };
   }
 
-  resetForNewTurn() {
-    this.turnHistory = [];
-    this.turnInteractionCount = 0; // Reset per-turn counter
+  public resetForNewTurn() {
+    // Roll turnHistory to only last 30 messages
+    this.turnHistory = this.turnHistory.slice(-MAX_MESSAGES);
+    this.turnInteractionCount = 0;
+    
+    // NEW: reset per-turn state
+    this.hasRolledThisTurn = false;
+    this.doublesCount = 0;
+  }
+
+  // NEW: Method for game engine to update roll state
+  public markRollResult(doubles: boolean) {
+    this.hasRolledThisTurn = true;
+    if (doubles) {
+      this.doublesCount += 1;
+    }
+  }
+
+  // NEW: Getter for game engine to check if roll is allowed
+  public canRollDice(): boolean {
+    // Can roll if:
+    // 1. Haven't rolled yet this turn, OR
+    // 2. Just rolled doubles (and less than 3 total)
+    return !this.hasRolledThisTurn || (this.doublesCount > 0 && this.doublesCount < 3);
   }
 
   async takeTurn(
@@ -369,24 +442,46 @@ Be concise. Use tools to act.`,
 
     const contextPrompt = `
 TURN ${gameState.turn} - ${me.name}
+
 Position: ${me.position} (${tiles[me.position].name})
 Money: $${me.money}
-Properties: ${me.properties.map((loc) => tiles[loc].name).join(', ') || 'None'}
+Properties: ${
+      me.properties.length
+        ? me.properties
+            .map((loc) => `${tiles[loc].name} (loc ${loc})`)
+            .join(', ')
+        : 'None'
+    }
 In Jail: ${me.inJail ? `Yes (turn ${me.jailTurns}/3)` : 'No'}
+
+TURN STATE:
+- Dice rolled this turn: ${this.hasRolledThisTurn ? 'YES' : 'NO'}
+- Doubles rolled this turn: ${this.doublesCount}
 
 Other Players:
 ${gameState.players
   .filter((p) => p.id !== this.player.id)
   .map(
     (p) =>
-      `- ${p.name}: $${p.money}, ${p.properties.length} properties${p.inJail ? ' [JAIL]' : ''}`
+      `- ${p.name}: $${p.money}, ${p.properties.length} properties${
+        p.inJail ? ' [JAIL]' : ''
+      }`
   )
   .join('\n')}
 
-${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, then end_turn.'}
+${
+  pendingAction
+    ? `ACTION REQUIRED: ${pendingAction}`
+    : 'Your turn. Use tools to act, then call end_turn when you are done.'
+}
 `.trim();
 
     this.turnHistory.push({ role: 'user', content: contextPrompt });
+
+    // AGGRESSIVE TRUNCATION: Keep only last MAX_MESSAGES
+    if (this.turnHistory.length > MAX_MESSAGES) {
+      this.turnHistory = this.turnHistory.slice(-MAX_MESSAGES);
+    }
 
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       this.systemPrompt,
@@ -399,15 +494,16 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         releaseSlot = await ProviderMgr.acquireSlot(this.model);
-
         const client = ProviderMgr.getClient(this.model);
+
         const params: any = {
           model: this.model.id,
           messages,
           tools: monopolyTools,
           tool_choice: 'auto',
-          temperature: 0.7,
+          temperature: 0.3,
         };
+
         if (this.model.maxTokens) {
           params.max_tokens = this.model.maxTokens;
         }
@@ -429,6 +525,10 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
 
         this.turnHistory.push(message);
 
+        if (this.turnHistory.length > MAX_MESSAGES) {
+          this.turnHistory = this.turnHistory.slice(-MAX_MESSAGES);
+        }
+
         const interaction: AgentInteraction = {
           timestamp: new Date().toISOString(),
           player: this.player.name,
@@ -445,7 +545,7 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
         };
 
         this.interactions.push(interaction);
-        this.turnInteractionCount++; // Increment per-turn counter
+        this.turnInteractionCount++;
         this.appendNDJSON('interactions.ndjson', interaction);
 
         const reasoning: ReasoningTrace = {
@@ -454,11 +554,12 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
           turn: gameState.turn,
           model: this.model.id,
           inputSummary: `pos=${me.position}, $${me.money}, props=${me.properties.length}`,
-          thought: message.content || '',
+          thought: (message as any).reasoning || message.content || '',
           chosenTools: (message.tool_calls || []).map(
             (t) => t.function.name || ''
           ),
         };
+
         this.appendNDJSON('reasoning.ndjson', reasoning);
 
         return interaction;
@@ -469,14 +570,18 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
         }
 
         lastError = err;
+
         const isRateLimit =
           err?.status === 429 ||
           err?.message?.toLowerCase().includes('rate limit') ||
           err?.message?.toLowerCase().includes('too many requests');
 
+        const is400Error = err?.status === 400;
+
         console.error(
-          `  ❌ ${this.player.name} error (attempt ${attempt}/${MAX_RETRIES}): ${err?.message || err}`
+          `  ❌ ${this.player.name} error (attempt ${attempt}/${MAX_RETRIES}): ${err?.status || ''} ${err?.message || err}`
         );
+        console.error(`  📊 Message count: ${messages.length}, turnHistory: ${this.turnHistory.length}`);
 
         this.appendNDJSON('errors.ndjson', {
           timestamp: new Date().toISOString(),
@@ -486,7 +591,17 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
           error: err?.message || String(err),
           status: err?.status,
           isRateLimit,
+          is400Error,
+          messageCount: messages.length,
+          turnHistoryLength: this.turnHistory.length,
         });
+
+        if (is400Error) {
+          console.warn(
+            `  ⚠️  400 error - clearing history (had ${this.turnHistory.length} messages)`
+          );
+          this.turnHistory = [];
+        }
 
         if (attempt < MAX_RETRIES) {
           const waitTime = isRateLimit
@@ -501,6 +616,7 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
     console.error(
       `  💀 All retries failed for ${this.player.name}, forcing end_turn`
     );
+
     const fallback: AgentInteraction = {
       timestamp: new Date().toISOString(),
       player: this.player.name,
@@ -517,9 +633,11 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
       tokensUsed: { prompt: 0, completion: 0, total: 0 },
       latency: Date.now() - startTime,
     };
+
     this.interactions.push(fallback);
-    this.turnInteractionCount++; // Increment even for fallback
+    this.turnInteractionCount++;
     this.appendNDJSON('interactions.ndjson', fallback);
+
     return fallback;
   }
 
@@ -532,6 +650,10 @@ ${pendingAction ? `ACTION REQUIRED: ${pendingAction}` : 'Your turn. Use tools, t
       tool_call_id: toolCall.id,
       content: JSON.stringify(result),
     });
+
+    if (this.turnHistory.length > MAX_MESSAGES) {
+      this.turnHistory = this.turnHistory.slice(-MAX_MESSAGES);
+    }
 
     this.appendNDJSON('tool_results.ndjson', {
       timestamp: new Date().toISOString(),
@@ -633,11 +755,8 @@ export class MonopolyMultiAgent {
       details,
       gameStateBefore: before,
     };
+
     this.logs.push(entry);
-    console.log(
-      `[Turn ${this.gameState.turn}] ${entry.player}: ${action}`,
-      details
-    );
     this.appendNDJSON('logs.ndjson', entry);
   }
 
