@@ -121,21 +121,66 @@ export const Client = new OpenAI({
 
 // Configure your models here with token limits
 export const models: modelSchema[] = [
+  // {
+  //   name: 'Gemini 3 Pro',
+  //   id: 'google/gemini-3-pro-preview',
+  //   provider: {
+  //     apiKey: process.env.GMI_KEY,
+  //     baseURL: 'https://api.gmi-serving.com/v1',
+  //   },
+  //   maxTokens: 800,
+  // },
   {
     name: 'GPT OSS 120B',
     id: 'openai/gpt-oss-120b',
-    maxTokens: 800, // Kimi is usually concise
+    maxTokens: 800,
+  },
+  {
+    name: 'Kimi K2.5',
+    id: 'moonshotai/kimi-k2.5',
+    maxTokens: 800,
+  },
+  {
+    name: 'Grok 4.1 Fast',
+    id: 'x-ai/grok-4.1-fast',
+    maxTokens: 800,
   },
   {
     name: 'Deepseek V3.2',
-    id: 'deepseek-ai/DeepSeek-V3.2',
-    provider: {
-      apiKey: process.env.GMI_KEY,
-      baseURL: 'https://api.gmi-serving.com/v1',
-    },
-    maxTokens: 300, // Deepseek is VERY verbose, cap it hard
+    id: 'deepseek/deepseek-v3.2',
+    // provider: {
+    //   apiKey: process.env.GMI_KEY,
+    //   baseURL: 'https://api.gmi-serving.com/v1',
+    // },
+    maxTokens: 800,
   },
-  // Add more models as needed
+  // {
+  //   name: 'GPT 4o',
+  //   id: 'openai/gpt-4o',
+  //   provider: {
+  //     apiKey: process.env.GMI_KEY,
+  //     baseURL: 'https://api.gmi-serving.com/v1',
+  //   },
+  //   maxTokens: 800,
+  // },
+  // {
+  //   name: 'Claude Sonnet 4.5',
+  //   id: 'anthropic/claude-sonnet-4.5',
+  //   provider: {
+  //     apiKey: process.env.GMI_KEY,
+  //     baseURL: 'https://api.gmi-serving.com/v1',
+  //   },
+  //   maxTokens: 800,
+  // },  
+  // {
+  //   name: 'Claude Opus 4.5',
+  //   id: 'anthropic/claude-opus-4.6',
+  //   provider: {
+  //     apiKey: process.env.GMI_KEY,
+  //     baseURL: 'https://api.gmi-serving.com/v1',
+  //   },
+  //   maxTokens: 800,
+  // },
 ];
 
 // Helper to generate players from models

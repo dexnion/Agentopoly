@@ -312,6 +312,30 @@ export const monopolyTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'pay_rent',
+      description: 'Pay pending rent to property owner.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pay_bank',
+      description: 'Pay pending amount to the bank (taxes, fines, fees).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pay_all_players',
+      description: 'Pay a pending amount to all other players (e.g. Chairman of the Board).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'get_game_state',
       description: 'Get current game state information.',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -357,6 +381,13 @@ export class MonopolyAgent {
   public turnInteractionCount = 0;
   private recordingsDir: string;
   
+  public pendingPayment: {
+    type: 'rent' | 'bank' | 'others';
+    amount: number;
+    payee: string | null;
+    description: string;
+  } | null = null;
+  
   // NEW: Track roll state
   private hasRolledThisTurn = false;
   private doublesCount = 0;
@@ -367,42 +398,37 @@ export class MonopolyAgent {
     this.recordingsDir = recordingsDir;
     this.systemPrompt = {
       role: 'system',
-      content: `You are playing Monopoly as ${player.name}. Win by the standard ruleset.
+      content: `You are playing Monopoly as ${player.name}. Win by bankrupting others.
 
-PROPERTY GROUPS (for building houses/hotels – must own ALL in group):
-- Brown: Mediterranean Avenue (1), Baltic Avenue (3)
-- Light Blue: Oriental Avenue (6), Vermont Avenue (8), Connecticut Avenue (9)
-- Pink: St. Charles Place (11), States Avenue (13), Virginia Avenue (14)
-- Orange: St. James Place (16), Tennessee Avenue (18), New York Avenue (19)
-- Red: Kentucky Avenue (21), Indiana Avenue (23), Illinois Avenue (24)
-- Yellow: Atlantic Avenue (26), Ventnor Avenue (27), Marvin Gardens (29)
-- Green: Pacific Avenue (31), North Carolina Avenue (32), Pennsylvania Avenue (34)
-- Dark Blue: Park Place (37), Boardwalk (39)
-- Railroads: Reading (5), Pennsylvania (15), B&O (25), Short Line (35)
-- Utilities: Electric Company (12), Water Works (28)
+COLOR GROUPS (locations):
+- Brown:1,3. LightBlue:6,8,9. Pink:11,13,14. Orange:16,18,19.
+- Red:21,23,24. Yellow:26,27,29. Green:31,32,34. DarkBlue:37,39.
+- Railroads:5,15,25,35. Utilities:12,28.
 
 RULES:
-- Roll dice to move, buy properties you land on, pay rent on opponent properties.
-- Complete color groups to build houses/hotels for higher rent.
-- You may roll the dice once per turn (you'll be allowed to roll again if you roll doubles).
-- Going bankrupt = losing.
+- Roll, buy unowned props, pay rent, trade.
+- Own ALL props in a color group = MONOPOLY = can build houses/hotels.
+- Houses cost varies by group. Build evenly across group. 4 houses -> hotel.
+- Houses multiply rent dramatically (10x-100x base rent!).
+- Bankruptcy = loss.
 
-TURN FLOW:
-1. Roll dice to move.
-2. Handle where you land (buy property, pay rent, draw card, etc.).
-3. Optionally build houses/hotels if you have monopolies and enough cash.
-4. Call end_turn when you are done with all actions for this turn.
+STRATEGY PRIORITY:
+1. Roll dice first (mandatory each turn).
+2. Buy unowned properties you land on (especially to complete color groups).
+3. **BUILD HOUSES/HOTELS** on any monopoly you hold - this is THE key to winning!
+   - Check "BUILDABLE" section in game state for where you can build.
+   - Build as many houses as you can afford on your monopolies.
+4. Trade to complete color groups, then build immediately.
+5. End turn when done.
+
+TRADING:
+- Use trade_property to propose trades.
+- When you receive a trade proposal, use respond_to_trade (accept=true/false).
+- Evaluate: does the trade help you complete a color group? Accept if so.
 
 CRITICAL:
-- You MUST call tools to take actions. You cannot act without tools.
-- If you roll doubles, you may roll again (the system will tell you "canRollAgain: true").
-- Prefer a small number of decisive tool calls over many redundant queries.
-
-Be concise. Use tools to act.
-
-FYI, null on a property being owned = unowned
-
-Good luck!
+- USE TOOLS. Call build_house with propertyLocation for EACH house you want to build.
+- NO chit-chat. State is in user prompt.
 `,
     };
   }
@@ -415,6 +441,7 @@ Good luck!
     // NEW: reset per-turn state
     this.hasRolledThisTurn = false;
     this.doublesCount = 0;
+    this.pendingPayment = null;
   }
 
   // NEW: Method for game engine to update roll state
@@ -433,48 +460,120 @@ Good luck!
     return !this.hasRolledThisTurn || (this.doublesCount > 0 && this.doublesCount < 3);
   }
 
+  private getCompressedState(state: GameState): string {
+    const me = state.players.find((p) => p.id === this.player.id)!;
+    const others = state.players.filter((p) => p.id !== this.player.id);
+    
+    let s = `Turn:${state.turn}. Me:${me.name}(${me.money}|Loc${me.position}). `;
+    s += others.map(p => `${p.name}(${p.money}|Loc${p.position})`).join(', ');
+
+    // Filter relevant properties: Owned by anyone, or current location
+    const relevantProps = state.properties.filter(p => 
+      p.owner !== null || 
+      state.players.some(pl => pl.position === p.tile.location)
+    );
+
+    if (relevantProps.length > 0) {
+      s += ' PROPS: ' + relevantProps.map(p => {
+        const owner = p.owner === this.player.id ? 'Me' : (state.players.find(pl => pl.id === p.owner)?.name || 'unk');
+        let det = `Loc${p.tile.location}:${owner}`;
+        if (p.mortgaged) det += '(M)';
+        if (p.houses) det += `(${p.houses}H)`;
+        if (p.hotels) det += `(${p.hotels}Htl)`;
+        return det;
+      }).join(',');
+    }
+
+    // Current Tile Details if unowned
+    const myTile = state.properties.find(p => p.tile.location === me.position);
+    if (myTile && !myTile.owner) {
+       s += ` | LANDED: ${myTile.tile.name} ($${myTile.tile.attributes.cost})`;
+    }
+
+    // Show buildable monopolies to encourage building
+    const myProps = state.properties.filter(p => p.owner === this.player.id);
+    const colorGroups: Record<string, typeof myProps> = {};
+    for (const p of myProps) {
+      const color = p.tile.attributes.color;
+      if (color) {
+        if (!colorGroups[color]) colorGroups[color] = [];
+        colorGroups[color].push(p);
+      }
+    }
+
+    const buildable: string[] = [];
+    for (const [color, props] of Object.entries(colorGroups)) {
+      // Check if player has monopoly on this color
+      const allInGroup = state.properties.filter(p => p.tile.attributes.color === color);
+      if (allInGroup.length === props.length) {
+        // Has monopoly!
+        for (const p of props) {
+          if (p.hotels === 0 && p.houses < 4) {
+            const cost = p.tile.attributes.houseCost || 0;
+            if (me.money >= cost) {
+              // Check even building
+              const minHouses = Math.min(...props.map(pr => pr.houses));
+              if (p.houses === minHouses) {
+                buildable.push(`Loc${p.tile.location}:${p.tile.name}($${cost}/house,${p.houses}H)`);
+              }
+            }
+          } else if (p.houses === 4 && p.hotels === 0) {
+            const cost = p.tile.attributes.houseCost || 0;
+            if (me.money >= cost) {
+              buildable.push(`Loc${p.tile.location}:${p.tile.name}($${cost}/hotel,4H->HTL)`);
+            }
+          }
+        }
+      }
+    }
+
+    if (buildable.length > 0) {
+      s += ` | BUILD NOW: ${buildable.join(', ')}. Use build_house or build_hotel!`;
+    }
+
+    // Show potential monopolies (need 1 more property to complete)
+    const tradeable: string[] = [];
+    for (const [color, props] of Object.entries(colorGroups)) {
+      const allInGroup = state.properties.filter(p => p.tile.attributes.color === color);
+      if (allInGroup.length - props.length === 1) {
+        const missing = allInGroup.find(p => p.owner !== this.player.id);
+        if (missing && missing.owner) {
+          const ownerName = state.players.find(pl => pl.id === missing.owner)?.name || 'unknown';
+          tradeable.push(`Need Loc${missing.tile.location}(${missing.tile.name}) from ${ownerName} to complete ${color}`);
+        }
+      }
+    }
+    if (tradeable.length > 0) {
+      s += ` | TRADE OPP: ${tradeable.join('; ')}`;
+    }
+
+    return s;
+  }
+
   async takeTurn(
     gameState: GameState,
     pendingAction?: string
   ): Promise<AgentInteraction> {
     const startTime = Date.now();
     const me = gameState.players.find((p) => p.id === this.player.id)!;
+    const compressedState = this.getCompressedState(gameState);
 
-    const contextPrompt = `
-TURN ${gameState.turn} - ${me.name}
 
-Position: ${me.position} (${tiles[me.position].name})
-Money: $${me.money}
-Properties: ${
-      me.properties.length
-        ? me.properties
-            .map((loc) => `${tiles[loc].name} (loc ${loc})`)
-            .join(', ')
-        : 'None'
+    let contextPrompt = `GAME STATE: ${compressedState}\n${pendingAction ? `PENDING ACTION: ${pendingAction}` : 'YOUR MOVE.'}`;
+
+    if (this.pendingPayment) {
+      const typeMap: Record<string, string> = { rent: 'pay_rent', bank: 'pay_bank', others: 'pay_all_players' };
+      contextPrompt += `\nCRITICAL: YOU OWE $${this.pendingPayment.amount} FOR ${this.pendingPayment.description.toUpperCase()}. USE ${typeMap[this.pendingPayment.type]} IMMEDIATELY.`;
     }
-In Jail: ${me.inJail ? `Yes (turn ${me.jailTurns}/3)` : 'No'}
 
-TURN STATE:
-- Dice rolled this turn: ${this.hasRolledThisTurn ? 'YES' : 'NO'}
-- Doubles rolled this turn: ${this.doublesCount}
-
-Other Players:
-${gameState.players
-  .filter((p) => p.id !== this.player.id)
-  .map(
-    (p) =>
-      `- ${p.name}: $${p.money}, ${p.properties.length} properties${
-        p.inJail ? ' [JAIL]' : ''
-      }`
-  )
-  .join('\n')}
-
-${
-  pendingAction
-    ? `ACTION REQUIRED: ${pendingAction}`
-    : 'Your turn. Use tools to act, then call end_turn when you are done.'
-}
-`.trim();
+    // Optimize history: Remove full state from previous user messages to save tokens.
+    // Replace them with a placeholder so the model knows a turn happened but doesn't re-read old states.
+    this.turnHistory = this.turnHistory.map(msg => {
+      if (msg.role === 'user' && typeof msg.content === 'string' && msg.content.includes('GAME STATE:')) {
+         return { ...msg, content: msg.content.split('\n')[0].substring(0, 20) + '... [Old State Omitted]' + (msg.content.includes('PENDING') ? '\n' + msg.content.split('\n').pop() : '') };
+      }
+      return msg;
+    });
 
     this.turnHistory.push({ role: 'user', content: contextPrompt });
 
@@ -523,7 +622,16 @@ ${
         const endTime = Date.now();
         const message = response.choices[0].message;
 
-        this.turnHistory.push(message);
+        // Optimize assistant history: remove reasoning/thought process if present, keep only tool calls
+        // This saves tokens on subsequent turns.
+        const optimizedMessage = { ...message };
+        if (optimizedMessage.content && optimizedMessage.tool_calls && optimizedMessage.tool_calls.length > 0) {
+           // If we have tool calls, the content (reasoning) is less critical for history context.
+           // Keep a minimal summary or remove it.
+           optimizedMessage.content = (optimizedMessage.content.slice(0, 50) + '...'); 
+        }
+
+        this.turnHistory.push(optimizedMessage);
 
         if (this.turnHistory.length > MAX_MESSAGES) {
           this.turnHistory = this.turnHistory.slice(-MAX_MESSAGES);
@@ -547,7 +655,6 @@ ${
         this.interactions.push(interaction);
         this.turnInteractionCount++;
         this.appendNDJSON('interactions.ndjson', interaction);
-
         const reasoning: ReasoningTrace = {
           timestamp: interaction.timestamp,
           player: this.player.name,

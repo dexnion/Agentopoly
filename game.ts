@@ -16,7 +16,7 @@ export class MonopolyBenchmark {
   public recordingsDir: string;
   private lastCardDrawn: { type: 'chance' | 'community_chest'; name: string; description: string; effect: any } | null = null;
 
-  constructor(players: Player[], modelDefs: modelSchema[], maxTurns = 200) {
+  constructor(players: Player[], modelDefs: modelSchema[], maxTurns = 500) {
     this.gameId = new Date().toISOString().replace(/[:.]/g, '-');
     this.recordingsDir = path.join(
       process.cwd(),
@@ -237,6 +237,12 @@ export class MonopolyBenchmark {
         return this.handlePayJailFine(player);
       case 'use_jail_card':
         return this.handleUseJailCard(player);
+      case 'pay_rent':
+        return this.handlePayRent(player, agent);
+      case 'pay_bank':
+        return this.handlePayBank(player, agent);
+      case 'pay_all_players':
+        return this.handlePayAllPlayers(player, agent);
       case 'trade_property':
         return this.handleTradeProposal(player, args);
       case 'respond_to_trade':
@@ -246,14 +252,23 @@ export class MonopolyBenchmark {
       case 'get_property_info':
         return this.handleGetPropertyInfo(args.propertyLocation);
       case 'end_turn':
+
+    // Optimize: only block if type is relevant? No, block everything until paid.
+    if (agent.pendingPayment) {
+        const typeMap: Record<string, string> = { rent: 'pay_rent', bank: 'pay_bank', others: 'pay_all_players' };
+        return {
+            success: false,
+            error: `Cannot end turn. You owe $${agent.pendingPayment.amount} for ${agent.pendingPayment.description}. Use ${typeMap[agent.pendingPayment.type]} tool.`
+        };
+    }
+
         return { success: true, turnEnded: true };
       default:
         return { success: false, error: `Unknown tool: ${fn}` };
     }
   }
 
-private handleRollDice(player: Player) {
-  const agent = this.multiAgent.getCurrentAgent();
+private handleRollDice(player: Player, agent: MonopolyAgent) {
   
   // Check if agent can roll (handles both initial roll and doubles re-roll)
   if (!agent.canRollDice()) {
@@ -263,6 +278,16 @@ private handleRollDice(player: Player) {
       error: 'You already rolled dice this turn. Call end_turn to finish your turn.',
     };
   }
+
+
+    if (agent.pendingPayment) {
+        const typeMap: Record<string, string> = { rent: 'pay_rent', bank: 'pay_bank', others: 'pay_all_players' };
+        return {
+            success: false,
+            error: `You owe $${agent.pendingPayment.amount} for ${agent.pendingPayment.description}. Use ${typeMap[agent.pendingPayment.type]} tool first.`
+        };
+    }
+
 
   // Roll once
   const roll = this.multiAgent.rollDice();
@@ -413,26 +438,57 @@ private handleRollDice(player: Player) {
       rent = this.currentDiceRoll.total * (count === 1 ? 4 : 10);
     }
 
-    console.log(` 💸 Paying $${rent} to ${owner.name}`);
-
-    if (player.money >= rent) {
-      player.money -= rent;
-      owner.money += rent;
-      const idx = this.multiAgent.logs.length;
-      this.multiAgent.log(
-        'PAY_RENT',
-        {
-          property: property.tile.name,
-          amount: rent,
-          to: owner.name,
-        },
-        player
-      );
-      this.multiAgent.logWithAfter(idx);
-    } else {
-      this.handleBankruptcy(player, owner);
+    console.log(` ⚠️  Rent due: $${rent} to ${owner.name}`);
+    const agent = this.multiAgent.getCurrentAgent();
+    agent.pendingPayment = {
+        type: 'rent',
+        amount: rent,
+        payee: owner.id,
+        description: `rent for ${property.tile.name} to ${owner.name}`
     }
   }
+
+  private handlePayRent(player: Player, agent: MonopolyAgent) {
+    if (!agent.pendingPayment || agent.pendingPayment.type !== 'rent') {
+        return { success: false, error: 'No pending rent payment' };
+    }
+
+    const { amount, payee } = agent.pendingPayment;
+    const owner = this.multiAgent.gameState.players.find(p => p.id === payee);
+    
+    if (!owner) { // Should not happen unless owner left?
+        agent.pendingPayment = null;
+        return { success: false, error: 'Owner not found' };
+    }
+
+    console.log(` 💸 Paying $${amount} rent to ${owner.name}`);
+
+    if (player.money >= amount) {
+        player.money -= amount;
+        owner.money += amount;
+        agent.pendingPayment = null; // Cleared
+
+        const idx = this.multiAgent.logs.length;
+        this.multiAgent.log(
+            'PAY_RENT',
+            {
+            property: 'pending_rent', // We lost the property ref but that's ok
+            amount: amount,
+            to: owner.name,
+            },
+            player
+        );
+        this.multiAgent.logWithAfter(idx);
+
+        return { success: true, paid: amount, to: owner.name };
+    } else {
+        // Can't clear payment yet
+        // this.handleBankruptcy(player, owner); // Bankruptcy handled elsewhere or maybe here?
+        // If we return success:false, the turn continues and they must find money.
+        return { success: false, error: `Insufficient funds. Need $${amount}, have $${player.money}. Trade or mortgage properties.` };
+    }
+  }
+
 
   private handleBuyProperty(player: Player, confirm: boolean) {
     const tile = tiles[player.position];
@@ -940,26 +996,16 @@ private executeCardEffect(player: Player, card: any) {
             }
             
             const rent = baseRent * attrs.rentMultiplier;
-            console.log(` 💸 Paying ${attrs.rentMultiplier}x rent: $${rent} to ${owner.name}`);
             
-            if (player.money >= rent) {
-              player.money -= rent;
-              owner.money += rent;
-              const idx = this.multiAgent.logs.length;
-              this.multiAgent.log(
-                'PAY_RENT_MULTIPLIED',
-                {
-                  property: property.tile.name,
-                  amount: rent,
-                  multiplier: attrs.rentMultiplier,
-                  to: owner.name,
-                },
-                player
-              );
-              this.multiAgent.logWithAfter(idx);
-            } else {
-              this.handleBankruptcy(player, owner);
-            }
+            console.log(` ⚠️  Rent due (x${attrs.rentMultiplier}): $${rent} to ${owner.name}`);
+            const agent = this.multiAgent.getCurrentAgent();
+            agent.pendingPayment = {
+                type: 'rent',
+                amount: rent,
+                payee: owner.id,
+                description: `${attrs.rentMultiplier}x rent for ${property.tile.name} to ${owner.name}`
+            };
+
           }
           
           // Handle dice multiplier (e.g., roll dice and pay 10x at utility)
@@ -968,28 +1014,17 @@ private executeCardEffect(player: Player, card: any) {
             const rent = diceRoll.total * attrs.diceMultiplier;
             
             console.log(` 🎲 Rolled ${diceRoll.die1} + ${diceRoll.die2} = ${diceRoll.total}`);
-            console.log(` 💸 Paying ${attrs.diceMultiplier}x dice roll: $${rent} to ${owner.name}`);
-            
-            if (player.money >= rent) {
-              player.money -= rent;
-              owner.money += rent;
-              const idx = this.multiAgent.logs.length;
-              this.multiAgent.log(
-                'PAY_RENT_DICE_MULTIPLIER',
-                {
-                  property: property.tile.name,
-                  diceRoll: diceRoll.total,
-                  multiplier: attrs.diceMultiplier,
-                  amount: rent,
-                  to: owner.name,
-                },
-                player
-              );
-              this.multiAgent.logWithAfter(idx);
-            } else {
-              this.handleBankruptcy(player, owner);
-            }
+            console.log(` ⚠️  Rent due (${attrs.diceMultiplier}x dice): $${rent} to ${owner.name}`);
+
+            const agent = this.multiAgent.getCurrentAgent();
+            agent.pendingPayment = {
+                type: 'rent',
+                amount: rent,
+                payee: owner.id,
+                description: `${attrs.diceMultiplier}x dice roll rent (${diceRoll.total} rolled)`
+            };
           }
+
         }
       } else {
         // Property unowned or owned by player - handle landing normally
@@ -1087,30 +1122,80 @@ private executeCardEffect(player: Player, card: any) {
     const worth = this.calculateNetWorth(player);
     const opt2 = Math.floor(worth * 0.1);
     const tax = Math.min(opt1, opt2);
-
-    if (player.money >= tax) {
-      player.money -= tax;
-      const idx = this.multiAgent.logs.length;
-      this.multiAgent.log('PAY_INCOME_TAX', { amount: tax }, player);
-      this.multiAgent.logWithAfter(idx);
-      console.log(` 💸 Paid $${tax} income tax`);
-    } else {
-      this.handleBankruptcy(player, null);
-    }
+    
+    console.log(` ⚠️  Income Tax due: $${tax}`);
+    const agent = this.multiAgent.getCurrentAgent();
+    agent.pendingPayment = {
+        type: 'bank',
+        amount: tax,
+        payee: null,
+        description: 'Income Tax'
+    };
   }
 
   private handleLuxuryTax(player: Player) {
     const tax = 75;
-    if (player.money >= tax) {
-      player.money -= tax;
-      const idx = this.multiAgent.logs.length;
-      this.multiAgent.log('PAY_LUXURY_TAX', { amount: tax }, player);
-      this.multiAgent.logWithAfter(idx);
-      console.log(' 💸 Paid $75 luxury tax');
-    } else {
-      this.handleBankruptcy(player, null);
-    }
+    console.log(` ⚠️  Luxury Tax due: $${tax}`);
+    const agent = this.multiAgent.getCurrentAgent();
+    agent.pendingPayment = {
+        type: 'bank',
+        amount: tax,
+        payee: null,
+        description: 'Luxury Tax'
+    };
   }
+
+
+
+  private handlePayBank(player: Player, agent: MonopolyAgent) {
+      if (!agent.pendingPayment || agent.pendingPayment.type !== 'bank') {
+          return { success: false, error: 'No pending bank pmt' };
+      }
+
+      const { amount, description } = agent.pendingPayment;
+      console.log(` 💸 Paying $${amount} to Bank for ${description}`);
+
+      if (player.money >= amount) {
+          player.money -= amount;
+          agent.pendingPayment = null; 
+
+          const idx = this.multiAgent.logs.length;
+          this.multiAgent.log('PAY_BANK', { amount, reason: description }, player);
+          this.multiAgent.logWithAfter(idx);
+
+          return { success: true, paid: amount };
+      } else {
+          return { success: false, error: `Insufficient funds. Need $${amount}.` };
+      }
+  }
+
+  private handlePayAllPlayers(player: Player, agent: MonopolyAgent) {
+       if (!agent.pendingPayment || agent.pendingPayment.type !== 'others') {
+          return { success: false, error: 'No pending pmt to others' };
+      }
+
+      const { amount, description } = agent.pendingPayment; // amount here is PER PLAYER
+      const others = this.multiAgent.gameState.players.filter(p => p.id !== player.id && !p.bankrupt);
+      const totalNeeded = amount * others.length;
+
+      console.log(` 💸 Paying $${amount} to each of ${others.length} players (Total: $${totalNeeded})`);
+
+      if (player.money >= totalNeeded) {
+          player.money -= totalNeeded;
+          others.forEach(p => p.money += amount);
+          agent.pendingPayment = null;
+
+          const idx = this.multiAgent.logs.length;
+          this.multiAgent.log('PAY_ALL_PLAYERS', { perPlayer: amount, total: totalNeeded, reason: description }, player);
+          this.multiAgent.logWithAfter(idx);
+
+          return { success: true, paidTotal: totalNeeded };
+      } else {
+          return { success: false, error: `Need $${totalNeeded} total ($${amount}/player). Have $${player.money}.` };
+      }
+  }
+
+
 
   private sendToJail(player: Player, reason: string) {
     player.position = 10;
@@ -1159,16 +1244,148 @@ private executeCardEffect(player: Player, card: any) {
     player.jailFreeCards = 0;
   }
 
-  private handleTradeProposal(player: Player, args: any) {
+  private async handleTradeProposal(player: Player, args: any) {
     console.log(` 🤝 ${player.name} proposes trade to ${args.targetPlayer}`);
     const idx = this.multiAgent.logs.length;
     this.multiAgent.log('TRADE_PROPOSAL', args, player);
     this.multiAgent.logWithAfter(idx);
-    return {
-      success: true,
-      tradePending: true,
-      message: 'Trade proposal recorded (actual negotiation not implemented).',
-    };
+
+    // Validate target player exists
+    const targetPlayer = this.multiAgent.gameState.players.find(
+      (p) => p.id === args.targetPlayer || p.name === args.targetPlayer
+    );
+    if (!targetPlayer || targetPlayer.bankrupt) {
+      return { success: false, error: 'Target player not found or is bankrupt' };
+    }
+    if (targetPlayer.id === player.id) {
+      return { success: false, error: 'Cannot trade with yourself' };
+    }
+
+    const offerProperties: number[] = args.offerProperties || [];
+    const requestProperties: number[] = args.requestProperties || [];
+    const offerMoney: number = args.offerMoney || 0;
+    const requestMoney: number = args.requestMoney || 0;
+
+    // Validate offered properties are owned by proposer and have no buildings
+    for (const loc of offerProperties) {
+      const prop = this.multiAgent.gameState.properties.find(p => p.tile.location === loc);
+      if (!prop) return { success: false, error: `Property at location ${loc} not found` };
+      if (prop.owner !== player.id) return { success: false, error: `You don't own ${prop.tile.name}` };
+      if (prop.houses > 0 || prop.hotels > 0) return { success: false, error: `${prop.tile.name} has buildings. Sell them first.` };
+    }
+
+    // Validate requested properties are owned by target and have no buildings
+    for (const loc of requestProperties) {
+      const prop = this.multiAgent.gameState.properties.find(p => p.tile.location === loc);
+      if (!prop) return { success: false, error: `Property at location ${loc} not found` };
+      if (prop.owner !== targetPlayer.id) return { success: false, error: `${targetPlayer.name} doesn't own ${prop.tile.name}` };
+      if (prop.houses > 0 || prop.hotels > 0) return { success: false, error: `${prop.tile.name} has buildings. Cannot trade.` };
+    }
+
+    // Validate money
+    if (offerMoney > player.money) return { success: false, error: `You only have $${player.money}` };
+    if (requestMoney > targetPlayer.money) return { success: false, error: `${targetPlayer.name} only has $${targetPlayer.money}` };
+
+    // Ask target agent for their decision
+    const targetAgent = this.multiAgent.agents.find(a => a.player.id === targetPlayer.id);
+    if (!targetAgent) return { success: false, error: 'Target agent not found' };
+
+    const offerPropNames = offerProperties.map(loc => {
+      const p = this.multiAgent.gameState.properties.find(pr => pr.tile.location === loc);
+      return p ? `${p.tile.name} (Loc ${loc})` : `Loc ${loc}`;
+    });
+    const requestPropNames = requestProperties.map(loc => {
+      const p = this.multiAgent.gameState.properties.find(pr => pr.tile.location === loc);
+      return p ? `${p.tile.name} (Loc ${loc})` : `Loc ${loc}`;
+    });
+
+    const tradeDescription = `TRADE PROPOSAL FROM ${player.name}:\n` +
+      `They OFFER you: ${offerPropNames.length > 0 ? offerPropNames.join(', ') : 'no properties'}${offerMoney > 0 ? ` + $${offerMoney}` : ''}\n` +
+      `They WANT from you: ${requestPropNames.length > 0 ? requestPropNames.join(', ') : 'no properties'}${requestMoney > 0 ? ` + $${requestMoney}` : ''}\n` +
+      `You MUST use respond_to_trade tool with accept=true or accept=false.`;
+
+    console.log(` 🤝 Asking ${targetPlayer.name} to respond to trade...`);
+
+    const interaction = await targetAgent.takeTurn(
+      this.multiAgent.gameState,
+      tradeDescription
+    );
+
+    // Parse target's response for respond_to_trade
+    const toolCalls = interaction.toolCalls || [];
+    let accepted = false;
+    let responded = false;
+
+    for (const call of toolCalls) {
+      if (call.function.name === 'respond_to_trade') {
+        const respArgs = this.parseToolArguments('respond_to_trade', call.function.arguments || '');
+        accepted = !!respArgs.accept;
+        responded = true;
+        targetAgent.addToolResult(call, { success: true, accepted });
+        break;
+      }
+    }
+
+    // If target didn't use the tool properly, treat as rejection
+    if (!responded) {
+      console.log(` ❌ ${targetPlayer.name} didn't respond properly, treating as rejection`);
+      accepted = false;
+    }
+
+    console.log(` 🤝 ${targetPlayer.name} ${accepted ? 'ACCEPTED' : 'REJECTED'} the trade`);
+
+    if (accepted) {
+      // Execute the trade
+      // Transfer offered properties to target
+      for (const loc of offerProperties) {
+        const prop = this.multiAgent.gameState.properties.find(p => p.tile.location === loc)!;
+        prop.owner = targetPlayer.id;
+        player.properties = player.properties.filter(l => l !== loc);
+        targetPlayer.properties.push(loc);
+      }
+      // Transfer requested properties to proposer
+      for (const loc of requestProperties) {
+        const prop = this.multiAgent.gameState.properties.find(p => p.tile.location === loc)!;
+        prop.owner = player.id;
+        targetPlayer.properties = targetPlayer.properties.filter(l => l !== loc);
+        player.properties.push(loc);
+      }
+      // Transfer money
+      player.money -= offerMoney;
+      targetPlayer.money += offerMoney;
+      player.money += requestMoney;
+      targetPlayer.money -= requestMoney;
+
+      const idx2 = this.multiAgent.logs.length;
+      this.multiAgent.log('TRADE_EXECUTED', {
+        proposer: player.name,
+        target: targetPlayer.name,
+        offerProperties: offerPropNames,
+        offerMoney,
+        requestProperties: requestPropNames,
+        requestMoney,
+      }, player);
+      this.multiAgent.logWithAfter(idx2);
+
+      return {
+        success: true,
+        accepted: true,
+        message: `Trade accepted by ${targetPlayer.name}! Properties and money exchanged.`,
+      };
+    } else {
+      const idx2 = this.multiAgent.logs.length;
+      this.multiAgent.log('TRADE_REJECTED', {
+        proposer: player.name,
+        target: targetPlayer.name,
+      }, player);
+      this.multiAgent.logWithAfter(idx2);
+
+      return {
+        success: true,
+        accepted: false,
+        message: `Trade rejected by ${targetPlayer.name}.`,
+      };
+    }
   }
 
   private handleTradeResponse(player: Player, accept: boolean) {
@@ -1379,7 +1596,7 @@ private executeCardEffect(player: Player, card: any) {
 
 async function main() {
   const NUM_GAMES = 1;
-  const MAX_TURNS_PER_GAME = 100;
+  const MAX_TURNS_PER_GAME = 2000;
 
   console.log(`\n🎮 Starting Monopoly Benchmark Suite`);
   console.log(`📊 Running ${NUM_GAMES} games with ${models.length} players\n`);
